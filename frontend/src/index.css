@@ -1,7 +1,16 @@
-body, html, #root {
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+body,
+html,
+#root {
   margin: 0;
   padding: 0;
   height: 100%;
   width: 100%;
-  overflow: hidden; /* Kaydırma çubuklarını gizle */
+  overflow: hidden;
+  background: #0b1220;
+  color: #e2e8f0;
 }

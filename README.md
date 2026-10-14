@@ -1,107 +1,201 @@
-# SkyWatcher Telemetry Simulator: Gerçek Zamanlı Uçuş Telemetri Paneli
+# UAV YKİ — İHA Yer Kontrol İstasyonu ve Çoklu İHA Telemetri Simülatörü
 
-Havalimanları arasında bir uçağın uçuşunu simüle eden ve **telemetri verilerini (konum, irtifa, hız, yakıt, hava durumu, uçuş durumu) gerçek zamanlı olarak** harita üzerinde gösteren bir yer kontrol istasyonu uygulamasıdır. Backend **Spring Boot** verileri üretip **WebSocket (STOMP)** ile yayınlar ve **PostgreSQL**'e kaydeder; **React + Leaflet** arayüzü canlı rotayı çizer ve geçmiş uçuşların seyir defterini sunar.
+Birden fazla insansız hava aracının (İHA) uçuşunu simüle eden, telemetrisini **gerçek zamanlı** harita üzerinde gösteren ve **PostgreSQL**'e kaydeden bir yer kontrol istasyonu (YKİ) uygulaması. Arka uç tamamen **modern C++ (C++20)** ile yazılmıştır; arayüz React + Leaflet'tir.
 
-## Özellikler
+![Kontrol paneli](docs/img/dashboard.png)
 
-- **Havalimanı seçimi:** Türkiye'den (Ankara Esenboğa, İstanbul Havalimanı, İzmir Adnan Menderes, Antalya) ve dünyadan (New York JFK, Londra Heathrow, Tokyo Haneda, Dubai) 8 havalimanı arasından kalkış ve varış seçimi
-- **Uçuş planı hesabı:** Haversine formülüyle iki havalimanı arasındaki gerçek mesafe (km) ve tahmini yakıt ihtiyacı
-- **Canlı telemetri:** Saniyede 10 güncelleme ile konum, irtifa, hız ve kalan yakıt; uçağın izlediği rota haritada canlı çizilir
-- **Hava durumu etkisi:** Her uçuşta rastgele bir hava durumu seçilir ve uçuş performansını etkiler
+> **Kapsam notu:** Proje yalnızca gözetleme/keşif sınıfı bir İHA'nın görev takibi, güvenlik (failsafe) davranışları ve veri kaydı üzerine kuruludur. Silah, hedefleme veya benzeri bir işlev içermez. Gerçek bir standarda (STANAG 4586, MAVLink vb.) uyumluluk **iddia edilmez**; alan modeli bu sistemlerden esinlenmiştir.
 
-  | Hava durumu | Hız | Yakıt tüketimi | İrtifa |
-  |---|---|---|---|
-  | Güneşli | 800 | Normal | Stabil |
-  | Rüzgarlı | 900 | Düşük | Hafif sallantı |
-  | Karlı | 700 | Yüksek | Stabil |
-  | Fırtınalı | 600 | Çok yüksek | Şiddetli türbülans |
+## Neler yapar?
 
-- **Uçuş durumları:** `FLYING`, `LANDED`, yakıt biterse `CRASHED`; düşük yakıt (< 300 L) ve düşüş uyarıları
-- **Seyir defteri:** Tüm uçuşlar veritabanında saklanır; geçmiş bir uçuş seçilip rotası haritada yeniden çizilebilir
+- **Çoklu İHA filosu:** Her İHA'nın çağrı adı, tipi (`MINI_RECON`, `ENDURANCE`), performans modeli ve görevi vardır. REST ile çalışma anında yeni İHA eklenebilir.
+- **Uçuş durum makinesi:** `Yerde → Kalkış → Tırmanış → Seyir ⇄ Bekleme (loiter) → Eve dönüş (RTL) → İniş → İndi` ve batarya biterse `Düştü`.
+- **Uçuş dinamiği:** Sınırlı dönüş hızı, ivmeli hız değişimi, tırmanış/alçalma oranı, **rüzgar vektörü ve ani esinti**; rüzgar yer hızını gerçekten etkiler.
+- **Enerji modeli:** Taban güç + sürtünme (`v³`) + tırmanış gücü. Eve dönüş için gereken enerji sürekli tahmin edilir.
+- **Güvenlik davranışları (failsafe):**
+  - Veri bağı kaybı belirli süreyi aşarsa otomatik **RTL**.
+  - **Coğrafi sınır (geofence):** Yasak bölgeye (no-fly) girme veya izinli bölgeden çıkma tespiti, otomatik RTL.
+  - Kritik batarya veya "eve dönmeye yetecek enerji kalmadı" durumunda otomatik RTL.
+- **Uyarı motoru:** Kenar tetiklemeli (aynı durum için tekrar tekrar alarm üretmez); önem düzeyi `WARNING` / `CRITICAL`.
+- **Canlı arayüz:** Yönlü İHA simgeleri, canlı iz, yasak bölge poligonları, batarya/bağ göstergeleri, uyarı paneli, rüzgar kontrolü, bağ kesme ve manuel RTL düğmeleri.
+- **Kayıt ve geri izleme:** Her uçuş (sorti) PostgreSQL'e yazılır; geçmiş bir sortinin rotası haritada yeniden çizilebilir.
 
 ## Mimari
 
-```
-React + Leaflet (frontend, :5173)
-   │  REST  /api/telemetry/**
-   │  WebSocket (STOMP)  ws://localhost:8080/ws  →  /topic/telemetry
-   ▼
-Spring Boot (:8080)
- ├── SimulationService   Uçuş simülasyonu (@Scheduled, 100 ms), yakıt/hava modeli
- ├── AirportService      Havalimanı veritabanı
- ├── TelemetryController REST uç noktaları
- └── WebSocketConfig     STOMP yayın altyapısı
-   ▼
-PostgreSQL (telemetry_db)  ← her telemetri örneği kaydedilir
+```mermaid
+flowchart LR
+    UI["React + Leaflet<br/>(tarayıcı)"]
+    subgraph SRV["C++ sunucu (uav_gcs_server)"]
+        NET["net/<br/>Boost.Beast<br/>HTTP + WebSocket"]
+        API["api/<br/>REST yönlendirme + JSON"]
+        CORE["core/<br/>Filo, İHA modeli,<br/>geofence, uyarılar"]
+        STORE["storage/<br/>libpqxx, göçler,<br/>toplu yazma"]
+        NET --> API --> CORE
+        API --> STORE
+    end
+    DB[("PostgreSQL")]
+    UI -- "REST /api/*" --> NET
+    NET -- "WebSocket /ws (10 Hz)" --> UI
+    STORE --> DB
 ```
 
-### REST API
+| Katman | Sorumluluk | Bağımlılık |
+|---|---|---|
+| `src/core` | Saf simülasyon: G/Ç yok, tamamen birim test edilebilir | Yalnızca standart kütüphane |
+| `src/storage` | Telemetri/uyarı kaydı, SQL göçleri, sorti sorguları | libpqxx |
+| `src/api` | REST uç noktaları, doğrulama, JSON dönüşümü | nlohmann/json |
+| `src/net` | HTTP + WebSocket sunucusu, CORS, yayın | Boost.Beast |
+| `src/app` | Yapılandırma, simülasyon döngüsü, kapanış | — |
+
+**Tasarım kararları**
+
+- **Çekirdek bağımsızdır.** `core` ağ ve veritabanını bilmez; bu yüzden uçuş modeli, geofence ve uyarılar milisaniyeler içinde test edilir.
+- **Simülasyon zamanı ölçeklenebilir** (`UAVGCS_TIME_SCALE`). Gerçek zamanda 20 dakikalık bir görev, varsayılan x10 ile 2 dakikada izlenir.
+- **Veritabanı yazması simülasyonu bloklamaz.** Örnekler bir kuyruğa alınır, arka plan iş parçacığı `COPY` ile toplu yazar. Telemetri saniyede bir örneklenir (simülasyon 10 Hz çalışır). Bağlantı koparsa bir kez yeniden bağlanıp yeniden dener.
+- **Veritabanı opsiyoneldir.** Bağlanılamazsa sunucu uyarı verip kayıt yapmadan çalışır; geçmiş uç noktaları `503` döner.
+- **Girdi doğrulaması:** Tüm REST girdileri aralık ve tip denetiminden geçer, gövde boyutu 1 MiB ile sınırlıdır, eşzamanlı bağlantı sayısı sınırlıdır.
+
+### Uçuş durum makinesi
+
+```mermaid
+stateDiagram-v2
+    [*] --> Preflight
+    Preflight --> Takeoff: görevi başlat
+    Takeoff --> Climb: 30 m
+    Climb --> Cruise: görev irtifası
+    Cruise --> Loiter: bekleme süresi olan nokta
+    Loiter --> Cruise: süre doldu
+    Cruise --> RTL: son nokta
+    Takeoff --> RTL: komut / failsafe
+    Climb --> RTL: komut / failsafe
+    Cruise --> RTL: komut / failsafe
+    Loiter --> RTL: komut / failsafe
+    RTL --> Landing: üsse yaklaştı
+    Landing --> Landed
+    Landed --> Takeoff: yeni sorti (batarya yenilenir)
+    Takeoff --> Crashed: batarya bitti
+    Climb --> Crashed: batarya bitti
+    Cruise --> Crashed: batarya bitti
+    Loiter --> Crashed: batarya bitti
+    RTL --> Crashed: batarya bitti
+    Landing --> Crashed: batarya bitti
+```
+
+## REST API
 
 | Yöntem | Uç nokta | Açıklama |
 |---|---|---|
-| `GET` | `/api/telemetry/airports` | Havalimanları ve koordinatları |
-| `GET` | `/api/telemetry/calculate` | Mesafe (Haversine) ve tahmini yakıt |
-| `POST` | `/api/telemetry/start-flight` | İki koordinat arasında uçuş başlatır |
-| `GET` | `/api/telemetry/flights` | Kayıtlı uçuş kodları |
-| `GET` | `/api/telemetry/history/{flightId}` | Seçilen uçuşun tüm telemetri kayıtları |
-| `GET` | `/api/telemetry/all` | Tüm telemetri kayıtları |
+| `GET` | `/api/health` | Durum, İHA sayısı, veritabanı bağlı mı |
+| `GET` / `POST` | `/api/uavs` | İHA'ları listele / yeni İHA ekle |
+| `GET` | `/api/uavs/{id}` | Tek İHA durumu |
+| `POST` | `/api/uavs/{id}/start` | Görevi başlat |
+| `POST` | `/api/uavs/{id}/rtl` | Eve dönüş komutu |
+| `POST` | `/api/uavs/{id}/link` | Veri bağını aç/kapat: `{"up": false}` |
+| `GET` | `/api/zones` | Coğrafi sınır bölgeleri |
+| `GET` | `/api/alerts?limit=` | Son uyarılar |
+| `GET` / `POST` | `/api/wind` | Rüzgar: `{"speed_mps":8,"from_deg":270,"gust_mps":2}` |
+| `GET` | `/api/sorties` | Kayıtlı uçuşlar (veritabanı gerekir) |
+| `GET` | `/api/sorties/{id}/track?max_points=` | Bir uçuşun rotası |
 
-WebSocket kanalı: `/topic/telemetry`
+Yeni İHA örneği:
 
-## Kullanılan Teknolojiler
+```bash
+curl -X POST http://localhost:8080/api/uavs -H "Content-Type: application/json" -d '{
+  "callsign": "YENI-4", "type": "MINI_RECON",
+  "home": {"lat": 39.80, "lon": 32.80},
+  "waypoints": [{"lat": 39.85, "lon": 32.85, "alt_m": 300, "loiter_s": 20}],
+  "start": true
+}'
+```
 
-- **Backend:** Java 17, Spring Boot 4 (Web MVC, WebSocket, Data JPA), Hibernate, PostgreSQL, Maven
-- **Frontend:** React 19, Vite 7, React-Leaflet / Leaflet (OpenStreetMap), @stomp/stompjs
-- **Kavramlar:** Gerçek zamanlı veri akışı, publish/subscribe (STOMP), zamanlanmış görevler, telemetri kaydı ve geriye dönük oynatma
+**WebSocket** `ws://localhost:8080/ws` yalnızca sunucudan istemciye yayındır:
 
-## Kurulum ve Çalıştırma
+- `{"type":"telemetry","sim_time_s":…,"time_scale":…,"uavs":[…]}` — saniyede 10 kez
+- `{"type":"alert","alert":{…}}` — yeni uyarı oluştuğunda
+
+## Kurulum
 
 ### Gereksinimler
-- JDK 17+
-- Node.js 18+ ve npm
-- PostgreSQL
 
-### 1. Veritabanı
+C++20 derleyicisi (GCC 15 / MinGW-w64 ve Ubuntu 24.04 üzerindeki GCC 13 hedeflenmiştir; CI bunu doğrular), CMake 3.20+, Ninja, Boost (başlık kütüphaneleri), libpqxx, nlohmann-json, GoogleTest, PostgreSQL ve arayüz için Node.js 18+.
+
+**Windows (MSYS2 UCRT64):**
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,boost,libpqxx,nlohmann-json,gtest}
+```
+
+**Ubuntu / Debian:**
+
+```bash
+sudo apt install cmake ninja-build g++ libboost-dev libpqxx-dev nlohmann-json3-dev libgtest-dev
+```
+
+### Derleme ve test
+
+```bash
+cmake -S . -B build -G Ninja
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+### Veritabanı
 
 ```sql
-CREATE DATABASE telemetry_db;
+CREATE DATABASE uavgcs;
 ```
 
-Tablo, uygulama ilk çalıştığında otomatik oluşturulur. Veritabanı şifresi ortam değişkeninden okunur:
+Tablolar, sunucu ilk açıldığında `db/migrations/*.sql` dosyalarından otomatik oluşturulur. Bağlantı bilgisi ortam değişkeninden okunur; **şifre koda veya depoya yazılmaz**:
 
 ```bash
-export DB_PASSWORD=postgres_sifreniz        # Windows PowerShell: $env:DB_PASSWORD="..."
+export UAVGCS_DB_URL="postgresql://kullanici:sifre@localhost:5432/uavgcs"
+# Windows PowerShell: $env:UAVGCS_DB_URL = "postgresql://..."
 ```
 
-### 2. Backend
+### Çalıştırma
 
 ```bash
-git clone https://github.com/MelihAliCagman/telemetry-simulator.git
-cd telemetry-simulator
-./mvnw spring-boot:run                      # Windows: mvnw.cmd spring-boot:run
+./build/uav_gcs_server                 # Windows: .\build\uav_gcs_server.exe
+cd frontend && npm install && npm run dev
 ```
 
-### 3. Frontend
+Arayüz `http://localhost:5173` adresinde açılır. Soldaki kartlardan **Göreve başla**'ya basın.
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
+### Yapılandırma (ortam değişkenleri)
 
-Arayüz `http://localhost:5173` adresinde açılır.
+| Değişken | Varsayılan | Açıklama |
+|---|---|---|
+| `UAVGCS_BIND` | `127.0.0.1` | Dinlenecek adres |
+| `UAVGCS_PORT` | `8080` | Port |
+| `UAVGCS_TIME_SCALE` | `10` | Simülasyon hız çarpanı (0–100) |
+| `UAVGCS_CORS_ORIGIN` | `http://localhost:5173` | İzin verilen arayüz kökeni |
+| `UAVGCS_DB_URL` | `postgresql://postgres@localhost:5432/uavgcs` | PostgreSQL bağlantısı |
+| `UAVGCS_DB` | `on` | `off` ise veritabanı kullanılmaz |
+| `UAVGCS_MIGRATIONS_DIR` | `db/migrations` | SQL göçleri dizini |
 
-### Kullanım
+Arayüz için sunucu adresi gerekirse `frontend/.env` içinde `VITE_API_URL=http://host:port` verilir.
 
-1. Soldaki panelden **Kalkış** ve **Varış** havalimanını seçin; mesafe ve planlanan yakıt görüntülenir.
-2. **Uçuşu Başlat** düğmesine basın. Uçak haritada ilerler, rota mavi çizgiyle çizilir.
-3. Sol panelin altındaki göstergelerden hava durumu, hız, irtifa ve yakıtı izleyin.
-4. **Geçmiş Uçuşlarım** ile kayıtlı uçuşları açıp rotalarını turuncu çizgiyle yeniden görüntüleyin.
+## Testler
 
-## Yol Haritası
+`55` birim testi: coğrafi hesaplar (Haversine, kerteriz, çokgen içinde nokta), İHA durum makinesi ve enerji modeli, rüzgarın yer hızına etkisi, deterministik tekrar (aynı tohum = aynı rota), link-loss failsafe, geofence ve uyarı motoru, filo yönetimi (eşzamanlı okuma/yazma dahil) ve REST doğrulaması. Veritabanı katmanı geliştirme sırasında gerçek bir PostgreSQL'e karşı elle doğrulanmıştır; otomatik entegrasyon testi yol haritasındadır.
 
-- Gerçekçi uçuş dinamikleri (rota üzerinde kalkış, seyir, iniş fazları)
-- Telemetri kayıtları için toplu yazma / örnekleme aralığı
-- Birden fazla uçağın eş zamanlı takibi
-- Gerçek hava durumu API'si entegrasyonu
-- Docker Compose ile tek komutla kurulum
+## Bilinen sınırlamalar
+
+- Uçuş modeli bir nokta-kütle yaklaşımıdır: rüzgar için "crab" açısı düzeltmesi, atmosfer yoğunluğu ve gerçek aerodinamik yoktur.
+- WebSocket istemcileri yalnızca dinler; komutlar REST ile gelir. Sunucu istemci kapanışını bir sonraki yazma hatasında fark eder.
+- Kimlik doğrulama yoktur; sunucu varsayılan olarak yalnızca `127.0.0.1` üzerinde dinler. Ağa açmadan önce bir kimlik doğrulama katmanı eklenmelidir.
+- Coğrafi sınır kontrolü sunucuda (C++) yapılır; PostGIS henüz kullanılmamaktadır.
+
+## Yol haritası
+
+- [ ] PostGIS ile geofence sorguları ve uçuş izlerinin mekânsal analizi
+- [ ] JWT ile kimlik doğrulama ve rol bazlı yetki (operatör / gözlemci)
+- [ ] Harita üzerinde tıklayarak görev (waypoint) planlama
+- [ ] Veritabanı katmanı için otomatik entegrasyon testleri
+- [ ] Docker Compose ile tek komutla kurulum
+- [ ] Daha ayrıntılı uçuş dinamiği (rüzgar düzeltmeli rota takibi)
+- [ ] İngilizce dokümantasyon
+
+## Geliştirici
+
+**Melih Ali Çağman** — [GitHub: MelihAliCagman](https://github.com/MelihAliCagman) · cagmanmelihali@gmail.com
