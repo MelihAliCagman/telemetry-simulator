@@ -19,9 +19,32 @@ find_package(nlohmann_json 3.2 REQUIRED)
 find_package(libpqxx CONFIG QUIET)
 if(NOT TARGET libpqxx::pqxx)
   find_package(PkgConfig REQUIRED)
-  pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET libpqxx)
+  pkg_check_modules(PQXX REQUIRED IMPORTED_TARGET GLOBAL libpqxx)
   add_library(libpqxx::pqxx ALIAS PkgConfig::PQXX)
 endif()
+
+# libpqxx başlıkları, derlendikleri C++ standardına göre farklı bir ABI sunar (std::source_location).
+# Dağıtım paketleri çoğunlukla C++17 ile derlenir, MSYS2 gibi sistemlerde C++20 ile. Bu yüzden
+# libpqxx'i kullanan kodu, kütüphaneyle gerçekten bağlanabilen standartla derliyoruz.
+set(UAVGCS_PQXX_STD "")
+# İçe aktarılan libpqxx hedefi bazı sistemlerde yalnızca Release için tanımlıdır; yoklama da Release ile yapılmalı.
+set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
+foreach(std 20 17)
+  if(NOT UAVGCS_PQXX_STD)
+    try_compile(PQXX_LINKS_${std}
+      SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/pqxx_abi_check.cpp
+      LINK_LIBRARIES libpqxx::pqxx
+      CXX_STANDARD ${std}
+      CXX_STANDARD_REQUIRED ON)
+    if(PQXX_LINKS_${std})
+      set(UAVGCS_PQXX_STD ${std})
+    endif()
+  endif()
+endforeach()
+if(NOT UAVGCS_PQXX_STD)
+  message(FATAL_ERROR "libpqxx ne C++20 ne de C++17 ile bağlanabildi; kurulumu kontrol edin.")
+endif()
+message(STATUS "libpqxx için C++${UAVGCS_PQXX_STD} kullanılıyor")
 
 # --- Çekirdek: saf simülasyon, G/Ç yok -------------------------------------
 add_library(uavgcs_core STATIC
@@ -39,6 +62,7 @@ target_link_libraries(uavgcs_core PUBLIC Threads::Threads)
 # --- Depolama: PostgreSQL ---------------------------------------------------
 add_library(uavgcs_storage STATIC src/storage/telemetry_store.cpp)
 target_link_libraries(uavgcs_storage PUBLIC uavgcs_core libpqxx::pqxx)
+set_target_properties(uavgcs_storage PROPERTIES CXX_STANDARD ${UAVGCS_PQXX_STD})
 
 # --- API: yönlendirme + JSON -------------------------------------------------
 add_library(uavgcs_api STATIC src/api/serialize.cpp src/api/api.cpp)
